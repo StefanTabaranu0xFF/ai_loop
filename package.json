@@ -1,0 +1,13 @@
+{
+  "name": "ai_loop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Goal-driven Node.js loop for generating, building, and validating C# projects with Ollama.",
+  "main": "ai_loop.js",
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
