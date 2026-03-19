@@ -27,7 +27,7 @@
 
 ```bash
 node ai_loop.js \
-  "Create a C# console app that reads all .json files produced by OpenLab and prints the number of records." \
+  "Create a C# console app that reads all .amx files produced by OpenLab and prints the number of records and extracts information from the files, the cli must also needs to know what kidnd of data is in the file" \
   --model gemma3:12b \
   --openlab-path ./openlab_output \
   --workspace ./generated_solution \

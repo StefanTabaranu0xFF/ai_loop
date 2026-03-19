@@ -4,3 +4,6 @@ generated_solution/
 *.pyc
 __pycache__/
 .pytest_cache/
+*.amx
+*.pmx
+.DS_Store

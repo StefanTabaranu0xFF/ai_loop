@@ -1,0 +1,15 @@
+﻿//FileVersion=>>2020-13-07 14:09:08.923
+//CreationDate=>>2020-06-05T00:57:55.3227884Z
+//CreatedBy=>>SYSTEM
+//LastModificationDate=>>2020-07-13T14:09:08.9232482Z
+//LastModificationBy=>>SYSTEM
+//Description=>>
+//Constant=>>
+//CreatedFromDAVersionTag=>>CDS-2.2
+
+154b9792-9eee-4838-b1af-5f751c6db572|True|Signal|Double|CC3|MAx_Peak_Height||=>>Min("Peak_Height", CurrentSignal.AllPeaks)
+f9147099-9e82-414d-a495-20430e004906|True|Signal|Double|CC4|Min_peak_area||=>>Min("Peak_Area", CurrentSignal.AllPeaks)
+d11715e7-5440-4a99-94eb-60c90ab95d05|True|PeakGroupCompound|Double|CC5|Peak_tailing||=>>Peak_TailingFactor
+ff5c9ece-4a28-440f-9b5a-8c4df66529af|True|PeakGroupCompound|Double|CC6|Max_Peak||=>>Max("Peak_Area", CurrentSignal.AllPeaks)
+f3f6fb7a-7123-4ded-83a2-effd165681ed|True|Injection|Double|CC7|Total_Peaks||Total_peaks_injecton=>>Count(CurrentInjection.AllPeaks)
+//CheckSum=>>3920A9C1177C1FB9F22D6BC5388AF200784665CE581F39824E419BF366CB638D
