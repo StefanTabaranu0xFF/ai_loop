@@ -1,0 +1,6 @@
+node_modules/
+generated_solution/
+.ai_loop/
+*.pyc
+__pycache__/
+.pytest_cache/
