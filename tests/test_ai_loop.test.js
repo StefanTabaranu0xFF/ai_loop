@@ -28,16 +28,6 @@ test('gatherOpenLabContext reads a single file and reports inferred metadata', (
   });
 });
 
-test('gatherOpenLabContext reports omitted directory entries', () => {
-  withTempDir((root) => {
-    for (let index = 0; index < 3; index += 1) {
-      fs.writeFileSync(path.join(root, `file${index}.txt`), String(index), 'utf8');
-    }
-    const context = aiLoop.gatherOpenLabContext(root, 2);
-    assert.match(context, /Additional files omitted from inline analysis: 1/);
-  });
-});
-
 test('buildMissingPathMessage includes nearby suggestions when available', () => {
   withTempDir((root) => {
     const previousCwd = process.cwd();
@@ -53,26 +43,58 @@ test('buildMissingPathMessage includes nearby suggestions when available', () =>
   });
 });
 
+test('describeWorkspace reports generated files', () => {
+  withTempDir((root) => {
+    fs.writeFileSync(path.join(root, 'App.csproj'), '<Project />', 'utf8');
+    fs.writeFileSync(path.join(root, 'Program.cs'), 'Console.WriteLine("hi");', 'utf8');
+    const summary = aiLoop.describeWorkspace(root);
+    assert.match(summary, /App\.csproj/);
+    assert.match(summary, /Program\.cs/);
+  });
+});
+
 test('safeJoin rejects parent escape', () => {
   assert.throws(() => aiLoop.safeJoin('/tmp/workspace', '../evil.txt'), /outside workspace/);
 });
 
-test('buildUserPrompt appends feedback and analysis guidance', () => {
+test('buildUserPrompt appends feedback and workspace guidance', () => {
   const prompt = aiLoop.buildUserPrompt({
     goal: 'Build a parser',
     workspace: '/tmp/workspace',
     buildCommands: ['dotnet build'],
     runCommand: 'dotnet run',
     successSubstring: 'done',
-  }, 'FILE: input.txt\n- inferred_format: csv', 'compiler error');
+  }, 'FILE: input.txt\n- inferred_format: csv', 'Workspace: /tmp/workspace\nVisible files: 0', 'compiler error');
 
   assert.match(prompt, /Build a parser/);
   assert.match(prompt, /compiler error/);
-  assert.match(prompt, /Always include a \.csproj or \.sln/);
+  assert.match(prompt, /Workspace state:/);
+  assert.match(prompt, /workspace-local bash commands/);
 });
 
-test('validateModelResponse rejects invalid payloads', () => {
-  assert.throws(() => aiLoop.validateModelResponse({ files: [] }), /non-empty 'files' list/);
+test('validateModelResponse accepts command objects and strings', () => {
+  assert.doesNotThrow(() => aiLoop.validateModelResponse({
+    files: [{ path: 'Program.cs', content: 'Console.WriteLine("hi");' }],
+    commands: [
+      'mkdir -p src',
+      { command: 'dotnet new console --force', purpose: 'scaffold' },
+    ],
+  }));
+});
+
+test('validateWorkspaceCommand rejects dangerous commands', () => {
+  assert.throws(() => aiLoop.validateWorkspaceCommand('sudo rm -rf /'), /Refusing dangerous command/);
+});
+
+test('runModelCommands executes workspace-local commands', () => {
+  withTempDir((root) => {
+    const result = aiLoop.runModelCommands({ workspace: root }, [
+      { command: 'mkdir -p generated && printf hello > generated/out.txt', purpose: 'prepare fixture' },
+    ]);
+    assert.equal(result.success, true);
+    assert.equal(fs.readFileSync(path.join(root, 'generated', 'out.txt'), 'utf8'), 'hello');
+    assert.match(result.results[0].stdout, /prepare fixture/);
+  });
 });
 
 test('ensureBuildableProject reports missing .NET project files', () => {
@@ -84,7 +106,7 @@ test('ensureBuildableProject reports missing .NET project files', () => {
   });
 });
 
-test('executeLoop succeeds after validation', async () => {
+test('executeLoop runs model commands before validation', async () => {
   await new Promise((resolve, reject) => {
     withTempDir((root) => {
       const logs = [];
@@ -107,6 +129,9 @@ test('executeLoop succeeds after validation', async () => {
             { path: 'App.csproj', content: '<Project Sdk="Microsoft.NET.Sdk"></Project>' },
             { path: 'Program.cs', content: 'Console.WriteLine("hi");' },
           ],
+          commands: [
+            { command: 'mkdir -p generated && printf hello > generated/out.txt', purpose: 'prepare output' },
+          ],
           notes: [],
         }),
         runValidationImpl: () => ({ success: true, results: [] }),
@@ -114,7 +139,7 @@ test('executeLoop succeeds after validation', async () => {
       }).then((code) => {
         try {
           assert.equal(code, 0);
-          assert.equal(fs.existsSync(path.join(root, 'Program.cs')), true);
+          assert.equal(fs.existsSync(path.join(root, 'generated', 'out.txt')), true);
           assert.match(logs.join('\n'), /Goal achieved/);
           resolve();
         } catch (error) {

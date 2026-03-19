@@ -5,6 +5,7 @@
 - read input artifacts produced by OpenLab,
 - analyze the files to infer likely format, record counts, and candidate fields,
 - ask an Ollama model to generate or repair a C# solution,
+- let the model request safe workspace-local bash commands or scripts,
 - write the returned files into a workspace,
 - compile, test, and optionally run the solution,
 - feed the real command output back to the model until the goal is achieved or the retry limit is reached.
@@ -13,10 +14,11 @@
 
 1. You provide a goal, for example: "Generate C# code that reads OpenLab `.amx` files and prints a record summary".
 2. `ai_loop.js` reads the files under `--openlab-path`, infers whether they look like XML, JSON, delimited text, key/value text, binary, or unknown `.amx` data, and extracts candidate field names and record estimates.
-3. The script calls the local Ollama HTTP API and requests a strict JSON response containing the files to write.
-4. The generated files are written into `--workspace`.
-5. Before running `dotnet build`, the loop checks that the model actually produced a `.csproj` or `.sln` file.
-6. If validation fails, the exact structural/build/test/runtime output is sent back to the model for the next repair attempt.
+3. Each iteration includes the current workspace state, so the model can repair an existing generated solution instead of starting blind.
+4. The model returns JSON containing files to write and optional workspace-local commands to run, such as `dotnet new`, directory creation, or local script execution.
+5. The generated files are written into `--workspace`, the requested commands are executed inside that workspace, and then validation runs.
+6. Before running `dotnet build`, the loop checks that the model actually produced a `.csproj` or `.sln` file.
+7. If validation fails, the exact structural/build/test/runtime output is sent back to the model for the next repair attempt.
 
 ## Requirements
 
@@ -38,24 +40,38 @@ node ai_loop.js \
   --success-substring "records"
 ```
 
-## Useful options
+## Model response behavior
 
-- `--dry-run`: print the fully constructed prompt without calling Ollama.
-- `--build-command ...`: provide one or more validation commands.
-- `--run-command ""`: skip the runtime execution step.
-- `--max-iterations N`: control how many repair rounds the loop performs.
-- `--file-limit N`: limit how many OpenLab files are inlined into the prompt.
-- `--ollama-host URL`: point to a non-default Ollama server.
+The model can now return both files and commands:
+
+```json
+{
+  "summary": "Scaffold and implement the parser",
+  "files": [
+    {"path": "src/App.csproj", "content": "<Project Sdk=\"Microsoft.NET.Sdk\">...</Project>"},
+    {"path": "src/Program.cs", "content": "using System; ..."}
+  ],
+  "commands": [
+    {"command": "mkdir -p src/tests", "purpose": "prepare folders"},
+    {"command": "bash scripts/setup.sh", "purpose": "run local setup script"}
+  ],
+  "notes": ["optional note"]
+}
+```
+
+Commands are executed inside the workspace, so the model can use the filesystem and issue bash commands without needing to rewrite everything as inline file content.
 
 ## Behavior improvements
 
-- If `--openlab-path` is wrong, the CLI now tries to suggest nearby matching directories from the current working tree.
-- The OpenLab prompt context now includes inferred file format, size, record estimates, candidate field names, and a preview or hex sample for each analyzed file.
+- If `--openlab-path` is wrong, the CLI tries to suggest nearby matching directories from the current working tree.
+- The OpenLab prompt context includes inferred file format, size, record estimates, candidate field names, and a preview or hex sample for each analyzed file.
+- The prompt includes the current workspace file list so the model can repair incrementally.
 - If the model forgets to generate a `.csproj` or `.sln`, the loop fails fast with a targeted repair message instead of only surfacing `MSB1003`.
-- Network failures to Ollama now include a clearer hint to check that Ollama is running and the requested model is installed.
+- Model-requested commands are restricted to workspace-local execution and obvious dangerous commands such as `sudo` or `rm -rf /` are rejected.
+- Network failures to Ollama include a clearer hint to check that Ollama is running and the requested model is installed.
 
 ## Notes
 
 - The script writes prompts, model responses, and command results to `.ai_loop/` inside the workspace for inspection.
 - The generated solution is constrained to stay inside the workspace directory.
-- The repository includes Node.js tests for prompt construction, path safety, OpenLab ingestion, missing-path diagnostics, and loop orchestration helpers.
+- The repository includes Node.js tests for prompt construction, path safety, OpenLab ingestion, missing-path diagnostics, workspace command execution, and loop orchestration helpers.

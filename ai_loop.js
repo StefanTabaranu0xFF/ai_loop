@@ -14,21 +14,37 @@ Always respond with JSON matching this shape:
     {"path": "relative/path.csproj", "content": "..."},
     {"path": "relative/Program.cs", "content": "..."}
   ],
+  "commands": [
+    {"command": "dotnet new console --force", "purpose": "scaffold the solution"}
+  ],
   "notes": ["optional bullet", "optional bullet"]
 }
 Rules:
 - Only write files that are needed for the solution.
 - Paths must be relative and must stay inside the workspace.
+- Commands run inside the workspace and may inspect files, create folders, invoke dotnet, or run local scripts inside the workspace.
 - Prefer using an SDK-style .NET project and include a .csproj or .sln.
 - Include tests when the goal can be tested.
 - When OpenLab files are provided, use the OpenLab analysis below as the source of truth for file formats, likely record structure, and candidate fields.
 - If the files are binary or partially unknown, create robust parser code that reports what it can infer and handles unsupported formats gracefully.
+- Never use sudo, never depend on interactive prompts, and never assume files exist outside the workspace unless they are shown in the OpenLab analysis.
 - Never wrap the JSON in markdown fences.`;
 
 const DEFAULT_BUILD_COMMANDS = ['dotnet build', 'dotnet test --no-build'];
 const DEFAULT_RUN_COMMAND = 'dotnet run --no-build';
 const MAX_INLINE_CONTENT = 12000;
 const MAX_FIELD_SAMPLES = 12;
+const MAX_WORKSPACE_FILES = 30;
+const DANGEROUS_COMMAND_PATTERNS = [
+  /\bsudo\b/i,
+  /\bgit\s+push\b/i,
+  /\brm\s+-rf\s+\//i,
+  /\bshutdown\b/i,
+  /\breboot\b/i,
+  /\bdd\s+if=/i,
+  /(^|\s)mkfs(\s|$)/i,
+  /(^|\s)mount(\s|$)/i,
+];
 
 function parseArgs(argv) {
   const options = {
@@ -136,6 +152,8 @@ Example:
     "Create a C# console app that reads all .amx files produced by OpenLab and prints the number of records." \
     --openlab-path ./openlab/Methods
 
+The model can both write files and request safe workspace-local bash commands such as dotnet scaffolding or script execution.
+
 Options:
   --model <name>               Ollama model name (default: gemma3:12b)
   --workspace <path>           Directory where generated files are written
@@ -186,7 +204,7 @@ function gatherOpenLabContext(openlabPath, limit) {
 function buildMissingPathMessage(openlabPath) {
   const cwd = process.cwd();
   const searchRoot = fs.existsSync(cwd) ? cwd : path.dirname(openlabPath);
-  const suggestions = findNearbyPaths(searchRoot, 8)
+  const suggestions = findNearbyPaths(searchRoot, 12)
     .filter((candidate) => candidate.toLowerCase().includes('openlab') || candidate.toLowerCase().includes('method'))
     .slice(0, 5);
 
@@ -231,6 +249,23 @@ function walkFiles(root) {
     }
     return entry.isFile() ? [resolved] : [];
   });
+}
+
+function describeWorkspace(workspace) {
+  if (!fs.existsSync(workspace)) {
+    return `Workspace does not exist yet: ${workspace}`;
+  }
+
+  const files = walkFiles(workspace)
+    .filter((filePath) => !filePath.includes(`${path.sep}.ai_loop${path.sep}`))
+    .map((filePath) => path.relative(workspace, filePath))
+    .slice(0, MAX_WORKSPACE_FILES);
+
+  return [
+    `Workspace: ${workspace}`,
+    `Visible files: ${files.length}`,
+    ...files,
+  ].join('\n');
 }
 
 function analyzeOpenLabFile(filePath, basePath) {
@@ -421,7 +456,7 @@ function toHexPreview(buffer) {
     .join(' ');
 }
 
-function buildUserPrompt(config, openlabContext, feedback) {
+function buildUserPrompt(config, openlabContext, workspaceContext, feedback) {
   const prompt = [
     'Goal:',
     config.goal,
@@ -432,7 +467,11 @@ function buildUserPrompt(config, openlabContext, feedback) {
     `- Run command after build/test: ${config.runCommand || 'skip'}`,
     `- Success substring requirement: ${config.successSubstring || 'none'}`,
     '- Always include a .csproj or .sln and any code needed to parse the discovered OpenLab file formats.',
+    '- You may request safe workspace-local bash commands to scaffold, inspect, or transform files before validation.',
     '- Use the OpenLab analysis below to infer likely record layout, candidate fields, and whether the file is text, XML-like, JSON, delimited, or binary.',
+    '',
+    'Workspace state:',
+    workspaceContext,
     '',
     'OpenLab analysis:',
     openlabContext,
@@ -482,6 +521,13 @@ async function callOllama(host, model, prompt) {
   return parsed;
 }
 
+function normalizeCommandSpec(commandSpec) {
+  if (typeof commandSpec === 'string') {
+    return { command: commandSpec, purpose: 'model-requested workspace command' };
+  }
+  return commandSpec;
+}
+
 function validateModelResponse(payload) {
   if (!payload || !Array.isArray(payload.files) || payload.files.length === 0) {
     throw new Error("Model response must include a non-empty 'files' list.");
@@ -493,6 +539,18 @@ function validateModelResponse(payload) {
     }
     if (typeof item.path !== 'string' || typeof item.content !== 'string') {
       throw new Error("Each file entry must include string 'path' and 'content'.");
+    }
+  }
+
+  if (payload.commands !== undefined) {
+    if (!Array.isArray(payload.commands)) {
+      throw new Error("'commands' must be an array when provided.");
+    }
+    for (const commandSpec of payload.commands) {
+      const normalized = normalizeCommandSpec(commandSpec);
+      if (!normalized || typeof normalized.command !== 'string') {
+        throw new Error("Each command entry must provide a string 'command'.");
+      }
     }
   }
 }
@@ -536,6 +594,55 @@ function makeResult(command, returncode, stdout, stderr) {
   };
 }
 
+function validateWorkspaceCommand(command) {
+  if (typeof command !== 'string' || !command.trim()) {
+    throw new Error('Command must be a non-empty string.');
+  }
+  for (const pattern of DANGEROUS_COMMAND_PATTERNS) {
+    if (pattern.test(command)) {
+      throw new Error(`Refusing dangerous command: ${command}`);
+    }
+  }
+  if (/\.\.\//.test(command)) {
+    throw new Error(`Refusing command that navigates outside the workspace: ${command}`);
+  }
+}
+
+function executeCommand(command, cwd) {
+  validateWorkspaceCommand(command);
+  const completed = spawnSync(command, {
+    cwd,
+    shell: true,
+    encoding: 'utf8',
+  });
+
+  return makeResult(
+    command,
+    completed.status ?? 1,
+    completed.stdout || '',
+    completed.stderr || (completed.error ? String(completed.error) : ''),
+  );
+}
+
+function runModelCommands(config, commands = []) {
+  const results = [];
+  for (const rawCommandSpec of commands) {
+    const commandSpec = normalizeCommandSpec(rawCommandSpec);
+    const prefix = commandSpec.purpose ? `# ${commandSpec.purpose}\n` : '';
+    try {
+      const result = executeCommand(commandSpec.command, config.workspace);
+      results.push(makeResult(`model-command: ${commandSpec.command}`, result.returncode, `${prefix}${result.stdout}`, result.stderr));
+      if (result.returncode !== 0) {
+        return { success: false, results };
+      }
+    } catch (error) {
+      results.push(makeResult(`model-command: ${commandSpec.command}`, 1, prefix, error.message));
+      return { success: false, results };
+    }
+  }
+  return { success: true, results };
+}
+
 function ensureBuildableProject(config) {
   const projectFiles = findProjectFiles(config.workspace);
   if (projectFiles.length > 0) {
@@ -555,18 +662,7 @@ function ensureBuildableProject(config) {
 }
 
 function runCommand(command, cwd) {
-  const completed = spawnSync(command, {
-    cwd,
-    shell: true,
-    encoding: 'utf8',
-  });
-
-  return makeResult(
-    command,
-    completed.status ?? 1,
-    completed.stdout || '',
-    completed.stderr || (completed.error ? String(completed.error) : ''),
-  );
+  return executeCommand(command, cwd);
 }
 
 function runValidation(config) {
@@ -634,9 +730,11 @@ function saveArtifacts(config, prompt, response, results) {
 async function executeLoop(config, dependencies = {}) {
   const {
     gatherOpenLabContextImpl = gatherOpenLabContext,
+    describeWorkspaceImpl = describeWorkspace,
     buildUserPromptImpl = buildUserPrompt,
     callOllamaImpl = callOllama,
     writeFilesImpl = writeFiles,
+    runModelCommandsImpl = runModelCommands,
     runValidationImpl = runValidation,
     saveArtifactsImpl = saveArtifacts,
     logger = console,
@@ -646,19 +744,26 @@ async function executeLoop(config, dependencies = {}) {
   let feedback = null;
 
   if (config.dryRun) {
-    logger.log(buildUserPromptImpl(config, openlabContext, feedback));
+    const workspaceContext = describeWorkspaceImpl(config.workspace);
+    logger.log(buildUserPromptImpl(config, openlabContext, workspaceContext, feedback));
     return 0;
   }
 
   for (let iteration = 1; iteration <= config.maxIterations; iteration += 1) {
-    const prompt = buildUserPromptImpl(config, openlabContext, feedback);
+    const workspaceContext = describeWorkspaceImpl(config.workspace);
+    const prompt = buildUserPromptImpl(config, openlabContext, workspaceContext, feedback);
     const response = await callOllamaImpl(config.ollamaHost, config.model, prompt);
     writeFilesImpl(config.workspace, response.files);
-    const { success, results } = runValidationImpl(config);
-    saveArtifactsImpl(config, prompt, response, results);
+
+    const commandRun = runModelCommandsImpl(config, response.commands || []);
+    const validationRun = commandRun.success ? runValidationImpl(config) : { success: false, results: [] };
+    const combinedResults = [...commandRun.results, ...validationRun.results];
+    const success = commandRun.success && validationRun.success;
+
+    saveArtifactsImpl(config, prompt, response, combinedResults);
 
     logger.log(`Iteration ${iteration}/${config.maxIterations}: ${response.summary || 'no summary'}`);
-    logger.log(results.length > 0 ? formatResults(results) : 'No commands were executed.');
+    logger.log(combinedResults.length > 0 ? formatResults(combinedResults) : 'No commands were executed.');
 
     if (success) {
       logger.log('Goal achieved.');
@@ -666,10 +771,10 @@ async function executeLoop(config, dependencies = {}) {
     }
 
     feedback = [
-      'The previous attempt did not meet the goal. Return a corrected .NET solution with all required project files.',
-      'Pay special attention to the OpenLab analysis when choosing how to parse the source files.',
+      'The previous attempt did not meet the goal. Return a corrected .NET solution with all required project files, file contents, and any workspace-local commands needed to prepare the project.',
+      'Pay special attention to the OpenLab analysis and the workspace state when choosing how to parse the source files and scaffold the solution.',
       '',
-      formatResults(results),
+      formatResults(combinedResults),
     ].join('\n');
   }
 
@@ -699,7 +804,9 @@ module.exports = {
   buildMissingPathMessage,
   buildUserPrompt,
   callOllama,
+  describeWorkspace,
   ensureBuildableProject,
+  executeCommand,
   executeLoop,
   findNearbyPaths,
   findProjectFiles,
@@ -713,14 +820,17 @@ module.exports = {
   isProbablyText,
   looksLikeDelimited,
   makeResult,
+  normalizeCommandSpec,
   parseArgs,
   runCommand,
+  runModelCommands,
   runValidation,
   safeJoin,
   saveArtifacts,
   summarizeExtensions,
   toHexPreview,
   validateModelResponse,
+  validateWorkspaceCommand,
   walkFiles,
   writeFiles,
 };
