@@ -20,15 +20,14 @@ Always respond with JSON matching this shape:
   "notes": ["optional bullet", "optional bullet"]
 }
 Rules:
-- Only write files that are needed for the solution.
-- Paths must be relative and must stay inside the workspace.
+- Either 'files' or 'commands' may be used, but at least one of them must be present and non-empty.
 - Commands run inside the workspace and may inspect files, create folders, invoke dotnet, or run local scripts inside the workspace.
 - Prefer using an SDK-style .NET project and include a .csproj or .sln.
 - Include tests when the goal can be tested.
 - When OpenLab files are provided, use the OpenLab analysis below as the source of truth for file formats, likely record structure, and candidate fields.
 - If the files are binary or partially unknown, create robust parser code that reports what it can infer and handles unsupported formats gracefully.
 - Never use sudo, never depend on interactive prompts, and never assume files exist outside the workspace unless they are shown in the OpenLab analysis.
-- Never wrap the JSON in markdown fences.`;
+- Never wrap the final answer in markdown fences unless you are embedding source code inside a file content string.`;
 
 const DEFAULT_BUILD_COMMANDS = ['dotnet build', 'dotnet test --no-build'];
 const DEFAULT_RUN_COMMAND = 'dotnet run --no-build';
@@ -153,6 +152,7 @@ Example:
     --openlab-path ./openlab/Methods
 
 The model can both write files and request safe workspace-local bash commands such as dotnet scaffolding or script execution.
+The loop also tolerates imperfect model output by normalizing fenced JSON, file maps, command-only plans, and common alternate keys.
 
 Options:
   --model <name>               Ollama model name (default: gemma3:12b)
@@ -468,6 +468,7 @@ function buildUserPrompt(config, openlabContext, workspaceContext, feedback) {
     `- Success substring requirement: ${config.successSubstring || 'none'}`,
     '- Always include a .csproj or .sln and any code needed to parse the discovered OpenLab file formats.',
     '- You may request safe workspace-local bash commands to scaffold, inspect, or transform files before validation.',
+    '- If you already have enough information to scaffold via commands, a command-only response is acceptable.',
     '- Use the OpenLab analysis below to infer likely record layout, candidate fields, and whether the file is text, XML-like, JSON, delimited, or binary.',
     '',
     'Workspace state:',
@@ -510,15 +511,35 @@ async function callOllama(host, model, prompt) {
     throw new Error(`Ollama response did not include message content: ${JSON.stringify(raw)}`);
   }
 
-  let parsed;
-  try {
-    parsed = JSON.parse(content);
-  } catch {
-    throw new Error(`Model response was not valid JSON: ${content}`);
+  return parseAndNormalizeModelResponse(content);
+}
+
+function parseAndNormalizeModelResponse(content) {
+  const candidates = [content, extractJsonCandidate(content)].filter(Boolean);
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate);
+      return normalizeModelResponse(parsed, content);
+    } catch {
+      // Keep trying alternate candidates.
+    }
+  }
+  throw new Error(`Model response was not valid JSON. Raw response starts with: ${content.slice(0, 400)}`);
+}
+
+function extractJsonCandidate(content) {
+  const fenced = content.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced?.[1]) {
+    return fenced[1].trim();
   }
 
-  validateModelResponse(parsed);
-  return parsed;
+  const start = content.indexOf('{');
+  const end = content.lastIndexOf('}');
+  if (start >= 0 && end > start) {
+    return content.slice(start, end + 1);
+  }
+
+  return null;
 }
 
 function normalizeCommandSpec(commandSpec) {
@@ -528,12 +549,83 @@ function normalizeCommandSpec(commandSpec) {
   return commandSpec;
 }
 
+function coerceFiles(rawFiles) {
+  if (!rawFiles) {
+    return [];
+  }
+  if (Array.isArray(rawFiles)) {
+    return rawFiles
+      .map((item) => {
+        if (typeof item === 'string') {
+          return null;
+        }
+        return {
+          path: item.path || item.filename || item.file || item.name,
+          content: item.content || item.contents || item.text || item.body,
+        };
+      })
+      .filter((item) => item && typeof item.path === 'string' && typeof item.content === 'string');
+  }
+  if (typeof rawFiles === 'object') {
+    return Object.entries(rawFiles)
+      .filter(([, value]) => typeof value === 'string')
+      .map(([filePath, content]) => ({ path: filePath, content }));
+  }
+  return [];
+}
+
+function coerceCommands(rawCommands) {
+  if (!rawCommands) {
+    return [];
+  }
+  if (Array.isArray(rawCommands)) {
+    return rawCommands.map(normalizeCommandSpec).filter((item) => item && typeof item.command === 'string');
+  }
+  if (typeof rawCommands === 'string') {
+    return [normalizeCommandSpec(rawCommands)];
+  }
+  return [];
+}
+
+function normalizeModelResponse(payload, originalContent = '') {
+  const files = coerceFiles(
+    payload.files
+    || payload.file
+    || payload.write_files
+    || payload.artifacts
+    || payload.project_files
+    || payload.output_files
+    || payload.project?.files,
+  );
+
+  const commands = coerceCommands(
+    payload.commands
+    || payload.command
+    || payload.shell_commands
+    || payload.bash
+    || payload.steps,
+  );
+
+  const normalized = {
+    summary: payload.summary || payload.title || payload.plan || 'model response',
+    files,
+    commands,
+    notes: Array.isArray(payload.notes) ? payload.notes : [],
+    rawContentPreview: originalContent.slice(0, 400),
+  };
+
+  validateModelResponse(normalized);
+  return normalized;
+}
+
 function validateModelResponse(payload) {
-  if (!payload || !Array.isArray(payload.files) || payload.files.length === 0) {
-    throw new Error("Model response must include a non-empty 'files' list.");
+  const hasFiles = Array.isArray(payload.files) && payload.files.length > 0;
+  const hasCommands = Array.isArray(payload.commands) && payload.commands.length > 0;
+  if (!payload || (!hasFiles && !hasCommands)) {
+    throw new Error("Model response must include at least one file or command. The raw model output could not be normalized into the expected schema.");
   }
 
-  for (const item of payload.files) {
+  for (const item of payload.files || []) {
     if (!item || typeof item !== 'object') {
       throw new Error('Each files entry must be an object.');
     }
@@ -565,7 +657,7 @@ function safeJoin(root, relativePath) {
   return candidate;
 }
 
-function writeFiles(root, files) {
+function writeFiles(root, files = []) {
   fs.mkdirSync(root, { recursive: true });
   return files.map((entry) => {
     const destination = safeJoin(root, entry.path);
@@ -753,7 +845,7 @@ async function executeLoop(config, dependencies = {}) {
     const workspaceContext = describeWorkspaceImpl(config.workspace);
     const prompt = buildUserPromptImpl(config, openlabContext, workspaceContext, feedback);
     const response = await callOllamaImpl(config.ollamaHost, config.model, prompt);
-    writeFilesImpl(config.workspace, response.files);
+    writeFilesImpl(config.workspace, response.files || []);
 
     const commandRun = runModelCommandsImpl(config, response.commands || []);
     const validationRun = commandRun.success ? runValidationImpl(config) : { success: false, results: [] };
@@ -772,6 +864,7 @@ async function executeLoop(config, dependencies = {}) {
 
     feedback = [
       'The previous attempt did not meet the goal. Return a corrected .NET solution with all required project files, file contents, and any workspace-local commands needed to prepare the project.',
+      'If you prefer to scaffold with commands first, return a valid command-only plan and then ensure the workspace contains a .csproj or .sln before validation.',
       'Pay special attention to the OpenLab analysis and the workspace state when choosing how to parse the source files and scaffold the solution.',
       '',
       formatResults(combinedResults),
@@ -804,10 +897,13 @@ module.exports = {
   buildMissingPathMessage,
   buildUserPrompt,
   callOllama,
+  coerceCommands,
+  coerceFiles,
   describeWorkspace,
   ensureBuildableProject,
   executeCommand,
   executeLoop,
+  extractJsonCandidate,
   findNearbyPaths,
   findProjectFiles,
   formatAnalyzedFile,
@@ -821,6 +917,8 @@ module.exports = {
   looksLikeDelimited,
   makeResult,
   normalizeCommandSpec,
+  normalizeModelResponse,
+  parseAndNormalizeModelResponse,
   parseArgs,
   runCommand,
   runModelCommands,

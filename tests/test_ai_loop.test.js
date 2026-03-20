@@ -53,6 +53,27 @@ test('describeWorkspace reports generated files', () => {
   });
 });
 
+test('extractJsonCandidate recovers fenced json payloads', () => {
+  const candidate = aiLoop.extractJsonCandidate('Here is the plan:\n```json\n{"commands": ["mkdir -p src"]}\n```');
+  assert.match(candidate, /mkdir -p src/);
+});
+
+test('normalizeModelResponse supports command-only responses', () => {
+  const normalized = aiLoop.normalizeModelResponse({ command: 'mkdir -p src && dotnet new console --force' });
+  assert.equal(normalized.files.length, 0);
+  assert.equal(normalized.commands.length, 1);
+});
+
+test('normalizeModelResponse supports file maps', () => {
+  const normalized = aiLoop.normalizeModelResponse({
+    files: {
+      'Program.cs': 'Console.WriteLine("hi");',
+      'App.csproj': '<Project />',
+    },
+  });
+  assert.equal(normalized.files.length, 2);
+});
+
 test('safeJoin rejects parent escape', () => {
   assert.throws(() => aiLoop.safeJoin('/tmp/workspace', '../evil.txt'), /outside workspace/);
 });
@@ -69,17 +90,20 @@ test('buildUserPrompt appends feedback and workspace guidance', () => {
   assert.match(prompt, /Build a parser/);
   assert.match(prompt, /compiler error/);
   assert.match(prompt, /Workspace state:/);
-  assert.match(prompt, /workspace-local bash commands/);
+  assert.match(prompt, /command-only response is acceptable/);
 });
 
-test('validateModelResponse accepts command objects and strings', () => {
+test('validateModelResponse accepts command-only responses', () => {
   assert.doesNotThrow(() => aiLoop.validateModelResponse({
-    files: [{ path: 'Program.cs', content: 'Console.WriteLine("hi");' }],
-    commands: [
-      'mkdir -p src',
-      { command: 'dotnet new console --force', purpose: 'scaffold' },
-    ],
+    files: [],
+    commands: [{ command: 'mkdir -p src', purpose: 'setup' }],
   }));
+});
+
+test('parseAndNormalizeModelResponse tolerates fenced JSON and alternate keys', () => {
+  const normalized = aiLoop.parseAndNormalizeModelResponse('```json\n{"write_files":{"Program.cs":"Console.WriteLine(\\"hi\\");"},"bash":"mkdir -p src"}\n```');
+  assert.equal(normalized.files.length, 1);
+  assert.equal(normalized.commands.length, 1);
 });
 
 test('validateWorkspaceCommand rejects dangerous commands', () => {
